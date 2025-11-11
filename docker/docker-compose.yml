@@ -22,7 +22,7 @@
 #                --profile push-notifications --profile sms --profile storage up
 # ----------------------------------------------------------------------------------------------
 
-version: '3.9'
+version: 3.9
 networks:
   default:
     name: 'conduit'
