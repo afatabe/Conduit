@@ -1,7 +1,7 @@
 import { Application, NextFunction, Request, Response } from 'express';
 import { createServer, Server as httpServer } from 'http';
 import { RemoteSocket, Server as IOServer, ServerOptions, Socket } from 'socket.io';
-import { createAdapter } from '@socket.io/redis-adapter';
+import { createAdapter } from '@socket.io/redis-streams-adapter';
 import { Cluster, Redis } from 'ioredis';
 import { ConduitRouter } from '../Router.js';
 import { isNil } from 'lodash-es';
@@ -20,8 +20,7 @@ export class SocketController extends ConduitRouter {
   private io: IOServer;
   private readonly options: Partial<ServerOptions>;
   private _registeredNamespaces: Map<string, ConduitSocket>;
-  private readonly pubClient: Redis | Cluster;
-  private readonly subClient: Redis | Cluster;
+  private readonly redisClient: Redis | Cluster;
   private globalMiddlewares: ((
     req: Request,
     res: Response,
@@ -46,14 +45,36 @@ export class SocketController extends ConduitRouter {
         origin: '*',
         methods: ['GET', 'POST'],
       },
+      connectionStateRecovery: {
+        // the backup duration of the sessions and the packets
+        maxDisconnectionDuration: 2 * 60 * 1000,
+        // whether to skip middlewares upon successful recovery
+        skipMiddlewares: false,
+      },
     };
     this.io = new IOServer(this.httpServer, this.options);
-    this.pubClient = grpcSdk.redisManager.getClient();
-    this.subClient = this.pubClient.duplicate();
-    this.io.adapter(createAdapter(this.pubClient, this.subClient));
+    this.redisClient = grpcSdk.redisManager.getClient();
+    this.io.adapter(
+      createAdapter(this.redisClient, {
+        onlyPlaintext: true,
+      }),
+    );
     this.httpServer.listen(this.port);
     this._registeredNamespaces = new Map();
     this.globalMiddlewares = [];
+
+    this.io.engine.on('connection_error', err => {
+      ConduitGrpcSdk.Logger.error(
+        `Socket connection error, code: ${err?.code ?? 'N/A'}, message: ${err.message}`,
+      );
+
+      ConduitGrpcSdk.Logger.error(
+        `Socket connection error, request: ${err?.req ?? 'N/A'}`,
+      );
+      ConduitGrpcSdk.Logger.error(
+        `Socket connection error, context: ${err?.context ?? 'N/A'}`,
+      );
+    });
   }
 
   registerGlobalMiddleware(
@@ -97,10 +118,8 @@ export class SocketController extends ConduitRouter {
       self
         .checkMiddlewares(context, conduitSocket.input.middlewares)
         .then(r => {
-          if (context.context) {
-            socket.data = context.context;
-          }
           Object.assign(context.context, r);
+          socket.data = context.context;
           next();
         })
         .catch((err: Error | ConduitError) => {
@@ -109,21 +128,26 @@ export class SocketController extends ConduitRouter {
     });
 
     this.io.of(namespace).on('connect', socket => {
-      ConduitGrpcSdk.Logger.info(
-        `Socket connected: ${socket.id} to namespace: ${namespace}`,
-      );
-      conduitSocket
-        .executeRequest({
-          event: 'connect',
-          socketId: socket.id,
-          // @ts-ignore
-          context: socket.request.conduit,
-        })
-        .then(res => this.handleResponse(res, socket, namespace))
-        .catch(e => {
-          ConduitGrpcSdk.Logger.error(e);
-          socket.emit('conduit_error', e);
-        });
+      if (socket.recovered) {
+        ConduitGrpcSdk.Logger.info(
+          `Socket recovered: ${socket.id} to namespace: ${namespace}`,
+        );
+      } else {
+        ConduitGrpcSdk.Logger.info(
+          `Socket connected: ${socket.id} to namespace: ${namespace}`,
+        );
+        conduitSocket
+          .executeRequest({
+            event: 'connect',
+            socketId: socket.id,
+            context: socket.data,
+          })
+          .then(res => this.handleResponse(res, socket, namespace))
+          .catch(e => {
+            ConduitGrpcSdk.Logger.error(e);
+            socket.emit('conduit_error', e);
+          });
+      }
 
       socket.onAny((event, ...args) => {
         ConduitGrpcSdk.Logger.info(`Socket event: ${event} from socket: ${socket.id}`);
@@ -132,8 +156,7 @@ export class SocketController extends ConduitRouter {
             event,
             socketId: socket.id,
             params: args,
-            // @ts-ignore
-            context: socket.request.conduit,
+            context: socket.data,
           })
           .then(res => this.handleResponse(res, socket, namespace))
           .catch(e => {
@@ -150,8 +173,7 @@ export class SocketController extends ConduitRouter {
           .executeRequest({
             event: 'disconnect',
             socketId: socket.id,
-            // @ts-ignore
-            context: socket.request.conduit,
+            context: socket.data,
           })
           .then(res => this.handleResponse(res, socket, namespace))
           .catch(e => {
@@ -287,7 +309,7 @@ export class SocketController extends ConduitRouter {
     userIds: string[],
     namespace: string,
   ): Promise<RemoteSocket<any, any>[]> {
-    const sockets = await this.io.in(namespace).fetchSockets();
+    const sockets = await this.io.of(namespace).fetchSockets();
     return sockets.filter(socket => {
       if (socket.data && socket.data.user) {
         return userIds.includes(socket.data.user._id);
@@ -310,7 +332,6 @@ export class SocketController extends ConduitRouter {
     super.shutDown();
     this.io.close();
     this.httpServer.close();
-    this.pubClient.quit();
-    this.subClient.quit();
+    this.redisClient.quit();
   }
 }
