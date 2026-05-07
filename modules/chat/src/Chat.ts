@@ -175,11 +175,11 @@ export default class Chat extends ManagedModule<Config> {
 
   async sendMessage(call: GrpcRequest<SendMessageRequest>, callback: GrpcCallback<null>) {
     const userId = call.request.userId;
-    const { roomId, message, messageType } = call.request;
+    const { roomId, message, messageType, persist } = call.request;
 
     let errorMessage: string | null = null;
     const room = await models.ChatRoom.getInstance()
-      .findOne({ _id: roomId })
+      .findOne({ _id: roomId, deleted: false, participants: userId })
       .catch((e: Error) => {
         errorMessage = e.message;
       });
@@ -187,41 +187,66 @@ export default class Chat extends ManagedModule<Config> {
       return callback({ code: status.INTERNAL, message: errorMessage });
     }
 
-    // @ts-ignore
-    if (isNil(room) || !room.participants.includes(userId)) {
+    if (isNil(room)) {
       return callback({ code: status.INVALID_ARGUMENT, message: 'invalid room' });
     }
 
-    models.ChatMessage.getInstance()
-      .create({
-        message,
-        messageType: messageType || MessageType.Text,
-        senderUser: userId,
-        room: roomId,
-        readBy: [userId],
-      })
-      .then(() => {
-        return this.grpcSdk.router?.socketPush({
-          event: 'message',
-          receivers: [],
-          rooms: [roomId],
-          data: JSON.stringify({
-            sender: userId,
+    const shouldPersist = persist !== false;
+    let messageId: string | undefined;
+    const createdAt = new Date().toISOString();
+    const resolvedType = messageType || MessageType.Text;
+
+    try {
+      if (shouldPersist) {
+        messageId = await this.grpcSdk.database!.generateId();
+        models.ChatMessage.getInstance()
+          .create({
+            _id: messageId,
             message,
+            messageType: resolvedType,
+            senderUser: userId,
             room: roomId,
-            contentType: messageType || MessageType.Text,
-          }),
-        });
-      })
-      .then(() => {
-        callback(null, null);
-      })
-      .catch((e: Error) => {
-        callback({
-          code: status.INTERNAL,
-          message: e.message,
-        });
+            readBy: [userId],
+          })
+          .catch(err => {
+            ConduitGrpcSdk.Logger.error(
+              `Failed to persist message ${messageId} in room ${roomId}: ${err.message}`,
+            );
+            this.grpcSdk.router?.socketPush({
+              event: 'message:error',
+              receivers: [userId],
+              rooms: [],
+              data: JSON.stringify({
+                _id: messageId,
+                room: roomId,
+                error: 'Message could not be saved',
+              }),
+            });
+          });
+      }
+
+      this.grpcSdk.router?.socketPush({
+        event: 'message',
+        receivers: [],
+        rooms: [roomId],
+        data: JSON.stringify({
+          _id: messageId,
+          sender: userId,
+          content: message,
+          message,
+          room: roomId,
+          contentType: resolvedType,
+          createdAt,
+        }),
       });
+
+      callback(null, null);
+    } catch (e: unknown) {
+      callback({
+        code: status.INTERNAL,
+        message: (e as Error).message,
+      });
+    }
   }
 
   async deleteRoom(call: GrpcRequest<DeleteRoomRequest>, callback: GrpcCallback<Room>) {

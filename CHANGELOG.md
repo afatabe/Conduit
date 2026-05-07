@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.16.26](https://github.com/ConduitPlatform/Conduit/compare/v0.16.25...v0.16.26) (2026-04-19)
+
+
+### Features
+
+* **database,grpc-sdk:** allow creation of ids through rpc to defer db ops ([425de8f](https://github.com/ConduitPlatform/Conduit/commit/425de8f47d7fa0de1da41572469f19ad2da2ac07))
+
+
+### Bug Fixes
+
+* **chat:** build issue ([02fbb8b](https://github.com/ConduitPlatform/Conduit/commit/02fbb8be9270de336dda1cb1bd9e5db2735cb1aa))
+
+### [0.16.25](https://github.com/ConduitPlatform/Conduit/compare/v0.16.24...v0.16.25) (2026-04-16)
+
+
+### Features
+
+* **chat:** allow clients to send non-persisting messages (grpc only) ([028106f](https://github.com/ConduitPlatform/Conduit/commit/028106f48e7a632ea74869d60cab7d028dc0ec9e))
+* **core:** introduce versioning in config ([#1454](https://github.com/ConduitPlatform/Conduit/issues/1454)) ([d829d21](https://github.com/ConduitPlatform/Conduit/commit/d829d21c3599ec4700e3b965f396df2c6ca907af))
+
+
+### Bug Fixes
+
+* **email:** attachments([#1452](https://github.com/ConduitPlatform/Conduit/issues/1452)) ([5e7b533](https://github.com/ConduitPlatform/Conduit/commit/5e7b5339edc9734f838b92c52381f0c5b819fa03))
+
+### [0.16.24](https://github.com/ConduitPlatform/Conduit/compare/v0.16.23...v0.16.24) (2026-03-24)
+
+
+### Bug Fixes
+
+* **authentication:** phone handlers mishandling existing user case ([1e665e6](https://github.com/ConduitPlatform/Conduit/commit/1e665e6f9176f3404abeabbdfa99e96a99d46bb5))
+* **chat:** deleteRoom sockets params ([#1446](https://github.com/ConduitPlatform/Conduit/issues/1446)) ([c7ce92c](https://github.com/ConduitPlatform/Conduit/commit/c7ce92c3ac5bab7dd3e2d8e8bb8e22cd6a9b1e31))
+* **email:** handle multi-line Handlebars tags in getHandleBarsValues ([e8f7120](https://github.com/ConduitPlatform/Conduit/commit/e8f71201bd947c27a88e6bd4c7bc0d8a3846283e))
+* **email:** sender overrides broken ([c991391](https://github.com/ConduitPlatform/Conduit/commit/c9913911c5e29cb2eebf890f0f5e76655ed13876))
+* **sms:** missing package ([afedfeb](https://github.com/ConduitPlatform/Conduit/commit/afedfeb32e162017c1e41aa5892368eed9df6c93))
+
 ### [0.16.23](https://github.com/ConduitPlatform/Conduit/compare/v0.16.22...v0.16.23) (2026-02-13)
 
 

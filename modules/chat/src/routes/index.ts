@@ -13,6 +13,7 @@ import {
 import {
   ConduitNumber,
   ConduitString,
+  ConduitObjectId,
   ConfigController,
   GrpcServer,
   RoutingManager,
@@ -25,9 +26,17 @@ import { InvitationRoutes } from './InvitationRoutes.js';
 import * as templates from '../templates/index.js';
 import { MessageType } from '../enums/messageType.enum.js';
 
+// Redis TTL for chat message nonce deduplication.
+const CHAT_NONCE_TTL_MS = 5 * 60 * 1000;
+const MEMBERSHIP_CACHE_TTL_MS = 30 * 1000;
+
 export class ChatRoutes {
   private readonly _routingManager: RoutingManager;
   private invitationRoutes: InvitationRoutes;
+  private pendingReads = new Map<
+    string,
+    { userIds: Set<string>; timer: ReturnType<typeof setTimeout> }
+  >();
 
   constructor(
     readonly server: GrpcServer,
@@ -212,6 +221,7 @@ export class ChatRoutes {
         .catch((e: Error) => {
           throw new GrpcError(status.INTERNAL, e.message);
         });
+      await this.invalidateMembershipCache(room._id);
       this.grpcSdk.router?.socketPush({
         event: 'join-room',
         receivers: users,
@@ -277,6 +287,7 @@ export class ChatRoutes {
             throw new GrpcError(status.INTERNAL, e.message);
           });
       }
+      await this.invalidateMembershipCache(room._id);
       this.grpcSdk.router?.socketPush({
         event: 'leave-room',
         receivers: [user._id],
@@ -438,6 +449,13 @@ export class ChatRoutes {
         });
     }
 
+    this.grpcSdk.router?.socketPush({
+      event: 'message-deleted',
+      receivers: [],
+      rooms: [message.room as string],
+      data: JSON.stringify({ messageId, room: message.room }),
+    });
+
     this.grpcSdk.bus?.publish('chat:delete:ChatMessage', JSON.stringify(messageId));
     return 'Message deleted successfully';
   }
@@ -462,16 +480,31 @@ export class ChatRoutes {
       .catch((e: Error) => {
         throw new GrpcError(status.INTERNAL, e.message);
       });
+
+    this.grpcSdk.router?.socketPush({
+      event: 'message-edited',
+      receivers: [],
+      rooms: [message.room as string],
+      data: JSON.stringify({
+        messageId,
+        message: newMessage,
+        room: message.room,
+      }),
+    });
+
     this.grpcSdk.bus?.publish(
       'chat:edit:ChatMessage',
-      JSON.stringify({ id: messageId, newMessage: message }),
+      JSON.stringify({ id: messageId, newMessage }),
     );
     return 'Message updated successfully';
   }
 
   async connect(call: ParsedSocketRequest): Promise<UnparsedSocketResponse> {
     const { user } = call.request.context;
-    const rooms = await ChatRoom.getInstance().findMany({ participants: user._id });
+    const rooms = await ChatRoom.getInstance().findMany(
+      { participants: user._id },
+      '_id',
+    );
     return { event: 'join-room', rooms: rooms.map((room: ChatRoom) => room._id) };
   }
 
@@ -491,15 +524,10 @@ export class ChatRoutes {
     return { event: 'join-room', rooms: rooms.map((room: ChatRoom) => room._id) };
   }
 
-  async onMessage(
-    call: ParsedSocketRequest,
-    callback: (response: UnparsedSocketResponse) => void,
-  ): Promise<UnparsedSocketResponse | undefined | void> {
+  async onMessage(call: ParsedSocketRequest): Promise<UnparsedSocketResponse> {
     const { user } = call.request.context;
     const [roomId, message] = call.request.params;
-    const room = await ChatRoom.getInstance().findOne({ _id: roomId, deleted: false });
-
-    if (isNil(room) || !room.participants.includes(user._id)) {
+    if (!(await this.verifyRoomMembership(roomId as string, user._id))) {
       throw new GrpcError(
         status.INVALID_ARGUMENT,
         "Room does not exist or you don't have access",
@@ -510,6 +538,7 @@ export class ChatRoutes {
       content?: string;
       files?: string[];
     };
+    let nonce: string | undefined;
     if (typeof message === 'string') {
       formattedMessage = {
         content: message,
@@ -559,62 +588,119 @@ export class ChatRoutes {
           `${message.contentType} messages need to have content`,
         );
       }
+      if (Object.hasOwn(message, 'nonce')) {
+        const n = (message as { nonce?: unknown }).nonce;
+        if (typeof n !== 'string' || n.length === 0) {
+          throw new GrpcError(
+            status.INVALID_ARGUMENT,
+            'When provided, nonce must be a non-empty string',
+          );
+        }
+        nonce = n;
+      }
       formattedMessage = message as any;
     }
 
     if (formattedMessage.contentType === MessageType.Typing) {
       return {
         event: 'message',
+        receivers: [],
         rooms: [roomId as string],
         data: { sender: user._id, contentType: MessageType.Typing, room: roomId },
       };
-    } else {
-      callback({
-        event: 'message',
-        rooms: [roomId as string],
-        data: {
-          sender: user._id,
-          contentType: formattedMessage.contentType,
-          content: formattedMessage.content,
-          files: formattedMessage.files,
-          room: roomId,
-        },
-      });
-      await ChatMessage.getInstance().create({
-        message: formattedMessage.content ?? '',
-        messageType: formattedMessage.contentType || MessageType.Text,
-        files: formattedMessage.files || [],
-        senderUser: user._id,
-        room: roomId,
-        readBy: [user._id],
-      });
-      ConduitGrpcSdk.Metrics?.increment('messages_sent_total');
     }
+
+    if (nonce) {
+      const existing = await this.checkNonceDedup(roomId as string, user._id, nonce);
+      if (existing) {
+        // Retry / idempotent resend: only notify the sender so other clients are not duplicated.
+        return {
+          event: 'message',
+          receivers: [user._id],
+          rooms: [],
+          data: {
+            _id: existing._id,
+            nonce,
+            sender: user._id,
+            contentType: existing.messageType,
+            content: existing.message,
+            files: existing.files,
+            room: roomId,
+          },
+        };
+      }
+    }
+
+    const messageId = await this.grpcSdk.database!.generateId();
+    const createdAt = new Date().toISOString();
+
+    const createPayload = {
+      _id: messageId,
+      message: formattedMessage.content ?? '',
+      messageType: formattedMessage.contentType || MessageType.Text,
+      files: formattedMessage.files || [],
+      senderUser: user._id,
+      room: roomId,
+      readBy: [user._id],
+    };
+
+    ChatMessage.getInstance()
+      .create(createPayload)
+      .then(created => {
+        if (nonce) {
+          this.recordNonce(roomId as string, user._id, nonce, created._id);
+        }
+        ConduitGrpcSdk.Metrics?.increment('messages_sent_total');
+      })
+      .catch(err => {
+        ConduitGrpcSdk.Logger.error(
+          `Failed to persist message ${messageId} in room ${roomId}: ${err.message}`,
+        );
+        this.grpcSdk.router?.socketPush({
+          event: 'message:error',
+          receivers: [user._id],
+          rooms: [],
+          data: JSON.stringify({
+            _id: messageId,
+            room: roomId,
+            error: 'Message could not be saved',
+          }),
+        });
+      });
+
+    return {
+      event: 'message',
+      receivers: [],
+      rooms: [roomId as string],
+      data: {
+        _id: messageId,
+        nonce,
+        sender: user._id,
+        contentType: formattedMessage.contentType,
+        content: formattedMessage.content,
+        files: formattedMessage.files,
+        room: roomId,
+        createdAt,
+      },
+    };
   }
 
   async onMessagesRead(call: ParsedSocketRequest): Promise<UnparsedSocketResponse> {
     const user: User = call.request.context.user;
     const [roomId] = call.request.params;
-    const room = await ChatRoom.getInstance().findOne({ _id: roomId, deleted: false });
-    if (isNil(room) || !(room.participants as string[]).includes(user._id)) {
+    if (!(await this.verifyRoomMembership(roomId as string, user._id))) {
       throw new GrpcError(
         status.INVALID_ARGUMENT,
         "Room does not exist or you don't have access",
       );
     }
 
-    const filterQuery = {
-      room: room._id,
-      readBy: { $ne: user._id },
-    };
-
-    await ChatMessage.getInstance().updateMany(filterQuery, {
-      $push: { readBy: user._id },
-    });
+    this.scheduleReadFlush(roomId as string, user._id);
     return {
       event: 'messagesRead',
-      rooms: [room._id],
-      data: { room: room._id, readBy: user._id },
+      receivers: [],
+      rooms: [roomId as string],
+      data: { room: roomId as string, readBy: user._id },
     };
   }
 
@@ -793,9 +879,14 @@ export class ChatRoutes {
           handler: this.onMessage.bind(this),
           params: [TYPE.String, TYPE.JSON],
           returnType: new ConduitRouteReturnDefinition('MessageResponse', {
+            _id: ConduitObjectId.Optional,
+            nonce: ConduitString.Optional,
             sender: TYPE.String,
-            message: TYPE.String,
+            content: ConduitString.Optional,
+            contentType: ConduitString.Optional,
+            files: [ConduitString.Optional],
             room: TYPE.String,
+            createdAt: ConduitString.Optional,
           }),
         },
         messagesRead: {
@@ -809,6 +900,94 @@ export class ChatRoutes {
       },
     );
     return this._routingManager.registerRoutes();
+  }
+
+  private async checkNonceDedup(
+    roomId: string,
+    userId: string,
+    nonce: string,
+  ): Promise<ChatMessage | null> {
+    if (!this.grpcSdk.state) return null;
+    const key = `chat:nonce:${roomId}:${userId}:${nonce}`;
+    const existingId = await this.grpcSdk.state.getKey(key);
+    if (!existingId) return null;
+    const existing = await ChatMessage.getInstance().findOne({
+      _id: existingId,
+      deleted: false,
+      senderUser: userId,
+      room: roomId,
+    });
+    return existing ?? null;
+  }
+
+  private async recordNonce(
+    roomId: string,
+    userId: string,
+    nonce: string,
+    messageId: string,
+  ): Promise<void> {
+    if (!this.grpcSdk.state) return;
+    const key = `chat:nonce:${roomId}:${userId}:${nonce}`;
+    await this.grpcSdk.state.setKey(key, messageId, CHAT_NONCE_TTL_MS);
+  }
+
+  private async verifyRoomMembership(roomId: string, userId: string): Promise<boolean> {
+    const cacheKey = `chat:membership:${roomId}`;
+    if (this.grpcSdk.state) {
+      const cached = await this.grpcSdk.state.getKey(cacheKey);
+      if (cached) {
+        const participants: string[] = JSON.parse(cached);
+        return participants.includes(userId);
+      }
+    }
+    const room = await ChatRoom.getInstance().findOne({
+      _id: roomId,
+      deleted: false,
+      participants: userId,
+    });
+    if (!room) return false;
+    if (this.grpcSdk.state) {
+      await this.grpcSdk.state.setKey(
+        cacheKey,
+        JSON.stringify(room.participants),
+        MEMBERSHIP_CACHE_TTL_MS,
+      );
+    }
+    return true;
+  }
+
+  private async invalidateMembershipCache(roomId: string): Promise<void> {
+    if (!this.grpcSdk.state) return;
+    await this.grpcSdk.state.clearKey(`chat:membership:${roomId}`);
+  }
+
+  private scheduleReadFlush(roomId: string, userId: string): void {
+    let entry = this.pendingReads.get(roomId);
+    if (!entry) {
+      entry = {
+        userIds: new Set(),
+        timer: setTimeout(() => this.flushReads(roomId), 500),
+      };
+      this.pendingReads.set(roomId, entry);
+    }
+    entry.userIds.add(userId);
+  }
+
+  private flushReads(roomId: string): void {
+    const entry = this.pendingReads.get(roomId);
+    if (!entry) return;
+    this.pendingReads.delete(roomId);
+    const promises = [...entry.userIds].map(userId =>
+      ChatMessage.getInstance().updateMany(
+        { room: roomId, readBy: { $ne: userId } },
+        { $push: { readBy: userId } },
+      ),
+    );
+    Promise.all(promises).catch(e => {
+      ConduitGrpcSdk.Logger.error(
+        `Failed to flush read receipts for room ${roomId}: ${e.message}`,
+      );
+    });
   }
 
   private async fetchAndValidateRoomById(
